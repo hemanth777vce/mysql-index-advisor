@@ -18,7 +18,7 @@ cities = ["Hyderabad", "Warangal", "Vijayawada", "Chennai", "Bengaluru"]
 # Generate 10,000 sample students
 records = []
 
-for i in range(10000):
+for i in range(9000):
     records.append((
         f"Student_{i + 1}",
         random.choice(departments),
