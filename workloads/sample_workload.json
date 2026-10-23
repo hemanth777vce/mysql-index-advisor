@@ -1,0 +1,34 @@
+{
+  "name": "Students Workload",
+  "description": "Representative query workload for index_advisor_test.students focusing on equality lookups",
+  "queries": [
+    {
+      "query_id": "dept_lookup",
+      "sql": "SELECT * FROM students WHERE department = %s",
+      "parameters": ["CSE"],
+      "weight": 1000.0,
+      "description": "High-frequency lookup of students by department"
+    },
+    {
+      "query_id": "dept_city_lookup",
+      "sql": "SELECT id, name, department, city, cgpa FROM students WHERE department = %s AND city = %s",
+      "parameters": ["ECE", "Hyderabad"],
+      "weight": 500.0,
+      "description": "Filtered lookup by department and city"
+    },
+    {
+      "query_id": "city_lookup",
+      "sql": "SELECT id, name, cgpa FROM students WHERE city = %s",
+      "parameters": ["Bengaluru"],
+      "weight": 250.0,
+      "description": "Regional student lookup by city"
+    },
+    {
+      "query_id": "city_dept_lookup",
+      "sql": "SELECT name, cgpa FROM students WHERE city = %s AND department = %s",
+      "parameters": ["Warangal", "MECH"],
+      "weight": 150.0,
+      "description": "Filtered lookup with reversed predicate order"
+    }
+  ]
+}
