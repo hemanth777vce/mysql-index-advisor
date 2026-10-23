@@ -11,14 +11,14 @@
     },
     {
       "query_id": "dept_city_lookup",
-      "sql": "SELECT id, name, department, city, cgpa FROM students WHERE department = %s AND city = %s",
+      "sql": "SELECT student_id, name, department, city, cgpa FROM students WHERE department = %s AND city = %s",
       "parameters": ["ECE", "Hyderabad"],
       "weight": 500.0,
       "description": "Filtered lookup by department and city"
     },
     {
       "query_id": "city_lookup",
-      "sql": "SELECT id, name, cgpa FROM students WHERE city = %s",
+      "sql": "SELECT student_id, name, cgpa FROM students WHERE city = %s",
       "parameters": ["Bengaluru"],
       "weight": 250.0,
       "description": "Regional student lookup by city"

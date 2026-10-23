@@ -38,6 +38,8 @@ def setup_mock_connection(mock_conn: MagicMock, explain_json_plans: Optional[Lis
         last_sql = str(mock_cursor.execute.call_args[0][0])
         if "DATABASE()" in last_sql:
             return (ALLOWED_DATABASE,)
+        if "lock_wait_timeout" in last_sql:
+            return (50,)
         if plan_idx < len(plans):
             res = plans[plan_idx]
             plan_idx += 1
@@ -46,6 +48,32 @@ def setup_mock_connection(mock_conn: MagicMock, explain_json_plans: Optional[Lis
 
     mock_cursor.fetchone.side_effect = dynamic_fetchone
     return mock_cursor
+
+
+def make_mock_catalog_handler():
+    """Create a stateful mock for get_table_indexes that tracks CREATE and DROP INDEX."""
+    import re
+    catalog = {}
+
+    def dynamic_get_indexes(conn, db, table):
+        return dict(catalog)
+
+    def track_ddl(sql, *args, **kwargs):
+        sql_str = str(sql)
+        if "CREATE INDEX" in sql_str:
+            m = re.search(r"CREATE INDEX `([^`]+)` ON `([^`]+)` \(([^)]+)\)", sql_str)
+            if m:
+                idx_name = m.group(1)
+                tbl = m.group(2)
+                cols = [c.strip().strip("`") for c in m.group(3).split(",")]
+                catalog[idx_name] = IndexMetadata(idx_name, tbl, cols, False, False, "BTREE")
+        elif "DROP INDEX" in sql_str:
+            m = re.search(r"DROP INDEX `([^`]+)` ON `([^`]+)`", sql_str)
+            if m:
+                idx_name = m.group(1)
+                catalog.pop(idx_name, None)
+
+    return dynamic_get_indexes, track_ddl
 
 
 def make_test_table_metadata() -> TableMetadata:
@@ -257,9 +285,10 @@ class TestLiveLifecycleAndGuaranteedCleanup:
             ],
         )
 
-        with patch("src.evaluator.get_table_indexes") as mock_get_indexes:
-            mock_get_indexes.return_value = {}  # No collision
+        dynamic_get_indexes, track_ddl = make_mock_catalog_handler()
+        mock_cursor.execute.side_effect = track_ddl
 
+        with patch("src.evaluator.get_table_indexes", side_effect=dynamic_get_indexes):
             meta = make_test_table_metadata()
             q = QueryItem("q1", "SELECT * FROM students WHERE department = %s", ("CSE",), 100.0, "students", ["department"])
             wl = Workload("TestWL", queries=[q])
@@ -280,8 +309,11 @@ class TestLiveLifecycleAndGuaranteedCleanup:
 
             assert report.mode == "live"
             assert report.was_created is True
+            assert report.creation_verified is True
             assert report.was_cleaned_up is True
+            assert report.cleanup_verified is True
             assert report.cleanup_error is None
+            assert report.cleanup_risk is None
 
             # Verify that both CREATE INDEX and DROP INDEX were executed
             all_executed_sql = [str(call_args[0][0]) for call_args in mock_cursor.execute.call_args_list]
@@ -299,16 +331,21 @@ class TestLiveLifecycleAndGuaranteedCleanup:
         mock_conn.cursor.return_value = mock_cursor
 
         def dynamic_fetchone():
+            if not mock_cursor.execute.call_args:
+                return (ALLOWED_DATABASE,)
             last_sql = str(mock_cursor.execute.call_args[0][0])
             if "DATABASE()" in last_sql:
                 return (ALLOWED_DATABASE,)
+            if "lock_wait_timeout" in last_sql:
+                return (50,)
             return (make_sample_explain_json(),)
 
         mock_cursor.fetchone.side_effect = dynamic_fetchone
 
-        with patch("src.evaluator.get_table_indexes") as mock_get_indexes:
-            mock_get_indexes.return_value = {}
+        dynamic_get_indexes, track_ddl = make_mock_catalog_handler()
+        mock_cursor.execute.side_effect = track_ddl
 
+        with patch("src.evaluator.get_table_indexes", side_effect=dynamic_get_indexes):
             # Baseline explain succeeds, but candidate explain raises RuntimeError inside TemporaryIndexManager
             with patch(
                 "src.evaluator.capture_explain_plan",
@@ -342,11 +379,22 @@ class TestLiveLifecycleAndGuaranteedCleanup:
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value = mock_cursor
-        mock_cursor.fetchone.return_value = (ALLOWED_DATABASE,)
+
+        def dynamic_fetchone():
+            if not mock_cursor.execute.call_args:
+                return (ALLOWED_DATABASE,)
+            last_sql = str(mock_cursor.execute.call_args[0][0])
+            if "DATABASE()" in last_sql:
+                return (ALLOWED_DATABASE,)
+            if "lock_wait_timeout" in last_sql:
+                return (50,)
+            return (ALLOWED_DATABASE,)
+
+        mock_cursor.fetchone.side_effect = dynamic_fetchone
 
         # Simulate CREATE INDEX failing
         def fail_on_create(sql, *args, **kwargs):
-            if "CREATE INDEX" in sql:
+            if "CREATE INDEX" in str(sql):
                 raise RuntimeError("Disk full / permission denied")
 
         mock_cursor.execute.side_effect = fail_on_create
@@ -363,7 +411,7 @@ class TestLiveLifecycleAndGuaranteedCleanup:
                 allow_live_ddl=True,
             )
 
-            with pytest.raises(RuntimeError, match="Disk full"):
+            with pytest.raises(EvaluationSafetyError, match="Disk full"):
                 with mgr:
                     pass
 
@@ -377,18 +425,30 @@ class TestLiveLifecycleAndGuaranteedCleanup:
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value = mock_cursor
-        mock_cursor.fetchone.return_value = (ALLOWED_DATABASE,)
+
+        def dynamic_fetchone():
+            if not mock_cursor.execute.call_args:
+                return (ALLOWED_DATABASE,)
+            last_sql = str(mock_cursor.execute.call_args[0][0])
+            if "DATABASE()" in last_sql:
+                return (ALLOWED_DATABASE,)
+            if "lock_wait_timeout" in last_sql:
+                return (50,)
+            return (ALLOWED_DATABASE,)
+
+        mock_cursor.fetchone.side_effect = dynamic_fetchone
+
+        dynamic_get_indexes, track_ddl = make_mock_catalog_handler()
 
         # CREATE succeeds, but DROP fails
         def fail_on_drop(sql, *args, **kwargs):
-            if "DROP INDEX" in sql:
+            if "DROP INDEX" in str(sql):
                 raise RuntimeError("Lock wait timeout during DROP")
+            return track_ddl(sql, *args, **kwargs)
 
         mock_cursor.execute.side_effect = fail_on_drop
 
-        with patch("src.evaluator.get_table_indexes") as mock_get_indexes:
-            mock_get_indexes.return_value = {}
-
+        with patch("src.evaluator.get_table_indexes", side_effect=dynamic_get_indexes):
             mgr = TemporaryIndexManager(
                 connection=mock_conn,
                 database_name=ALLOWED_DATABASE,
@@ -402,8 +462,237 @@ class TestLiveLifecycleAndGuaranteedCleanup:
                     pass
 
             assert mgr.was_created is True
+            assert mgr.creation_verified is True
             assert mgr.was_cleaned_up is False
             assert "CLEANUP FAILURE" in str(mgr.cleanup_error)
+            assert mgr.cleanup_risk is not None
+
+    def test_lock_wait_timeout_configured_and_restored(self) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+
+        executed_sql = []
+        def dynamic_exec(sql, *args, **kwargs):
+            executed_sql.append(str(sql))
+            return track_ddl(sql, *args, **kwargs)
+
+        dynamic_get_indexes, track_ddl = make_mock_catalog_handler()
+        mock_cursor.execute.side_effect = dynamic_exec
+
+        def dynamic_fetchone():
+            if not executed_sql:
+                return (ALLOWED_DATABASE,)
+            last = executed_sql[-1]
+            if "DATABASE()" in last:
+                return (ALLOWED_DATABASE,)
+            if "lock_wait_timeout" in last:
+                return (31536000,)
+            return (ALLOWED_DATABASE,)
+
+        mock_cursor.fetchone.side_effect = dynamic_fetchone
+
+        with patch("src.evaluator.get_table_indexes", side_effect=dynamic_get_indexes):
+            mgr = TemporaryIndexManager(
+                connection=mock_conn,
+                database_name=ALLOWED_DATABASE,
+                table_name=ALLOWED_TABLE,
+                candidate_columns=("city",),
+                allow_live_ddl=True,
+                lock_wait_timeout=5,
+            )
+
+            with mgr:
+                assert mgr.original_lock_wait_timeout == 31536000
+                set_5_calls = [s for s in executed_sql if "SET SESSION lock_wait_timeout = 5" in s]
+                assert len(set_5_calls) == 1
+
+            restore_calls = [s for s in executed_sql if "SET SESSION lock_wait_timeout = 31536000" in s]
+            assert len(restore_calls) == 1
+
+    def test_lock_wait_timeout_failure_prevents_creation(self) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+
+        def dynamic_exec(sql, *args, **kwargs):
+            if "lock_wait_timeout" in str(sql):
+                raise RuntimeError("Access denied for system variable lock_wait_timeout")
+
+        mock_cursor.execute.side_effect = dynamic_exec
+        mock_cursor.fetchone.return_value = (ALLOWED_DATABASE,)
+
+        with patch("src.evaluator.get_table_indexes") as mock_get_indexes:
+            mock_get_indexes.return_value = {}
+
+            mgr = TemporaryIndexManager(
+                connection=mock_conn,
+                database_name=ALLOWED_DATABASE,
+                table_name=ALLOWED_TABLE,
+                candidate_columns=("city",),
+                allow_live_ddl=True,
+            )
+
+            with pytest.raises(EvaluationSafetyError, match="Failed to configure session lock_wait_timeout"):
+                with mgr:
+                    pass
+
+            assert mgr.was_created is False
+            all_executed_sql = [str(call_args[0][0]) for call_args in mock_cursor.execute.call_args_list]
+            create_stmts = [s for s in all_executed_sql if "CREATE INDEX" in s.upper()]
+            assert len(create_stmts) == 0
+
+    def test_post_creation_verification_column_mismatch_cleans_up(self) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+
+        executed_sql = []
+        def track_exec(sql, *args, **kwargs):
+            executed_sql.append(str(sql))
+
+        mock_cursor.execute.side_effect = track_exec
+
+        def dynamic_fetchone():
+            if not executed_sql:
+                return (ALLOWED_DATABASE,)
+            last_sql = executed_sql[-1]
+            if "DATABASE()" in last_sql:
+                return (ALLOWED_DATABASE,)
+            if "lock_wait_timeout" in last_sql:
+                return (50,)
+            return (ALLOWED_DATABASE,)
+
+        mock_cursor.fetchone.side_effect = dynamic_fetchone
+
+        def mismatched_get_indexes(conn, db, table):
+            import re
+            for s in executed_sql:
+                if "CREATE INDEX" in s:
+                    m = re.search(r"CREATE INDEX `([^`]+)`", s)
+                    if m:
+                        idx_name = m.group(1)
+                        if not any("DROP INDEX" in d for d in executed_sql):
+                            return {idx_name: IndexMetadata(idx_name, "students", ["department"], False, False, "BTREE")}
+            return {}
+
+        with patch("src.evaluator.get_table_indexes", side_effect=mismatched_get_indexes):
+            mgr = TemporaryIndexManager(
+                connection=mock_conn,
+                database_name=ALLOWED_DATABASE,
+                table_name=ALLOWED_TABLE,
+                candidate_columns=("city",),
+                allow_live_ddl=True,
+            )
+
+            with pytest.raises(EvaluationSafetyError, match="Post-creation column verification failed"):
+                with mgr:
+                    pass
+
+            assert mgr.was_created is True
+            assert mgr.creation_verified is False
+            drop_stmts = [s for s in executed_sql if "DROP INDEX" in s.upper()]
+            assert len(drop_stmts) == 1
+
+    def test_post_drop_verification_failure_raises_error(self) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+
+        def dynamic_fetchone():
+            if not mock_cursor.execute.call_args:
+                return (ALLOWED_DATABASE,)
+            last_sql = str(mock_cursor.execute.call_args[0][0])
+            if "DATABASE()" in last_sql:
+                return (ALLOWED_DATABASE,)
+            if "lock_wait_timeout" in last_sql:
+                return (50,)
+            return (ALLOWED_DATABASE,)
+
+        mock_cursor.fetchone.side_effect = dynamic_fetchone
+
+        def lingering_get_indexes(conn, db, table):
+            import re
+            for call_args in mock_cursor.execute.call_args_list:
+                s = str(call_args[0][0])
+                m = re.search(r"CREATE INDEX `([^`]+)`", s)
+                if m:
+                    idx_name = m.group(1)
+                    return {idx_name: IndexMetadata(idx_name, "students", ["city"], False, False, "BTREE")}
+            return {}
+
+        with patch("src.evaluator.get_table_indexes", side_effect=lingering_get_indexes):
+            mgr = TemporaryIndexManager(
+                connection=mock_conn,
+                database_name=ALLOWED_DATABASE,
+                table_name=ALLOWED_TABLE,
+                candidate_columns=("city",),
+                allow_live_ddl=True,
+            )
+
+            with pytest.raises(EvaluationCleanupError, match="CLEANUP VERIFICATION FAILURE.*still present in catalog"):
+                with mgr:
+                    pass
+
+            assert mgr.was_created is True
+            assert mgr.creation_verified is True
+            assert mgr.cleanup_verified is False
+            assert mgr.was_cleaned_up is False
+            assert mgr.cleanup_risk is not None
+
+    def test_ambiguous_creation_error_handling(self) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+
+        def dynamic_fetchone():
+            if not mock_cursor.execute.call_args:
+                return (ALLOWED_DATABASE,)
+            last_sql = str(mock_cursor.execute.call_args[0][0])
+            if "DATABASE()" in last_sql:
+                return (ALLOWED_DATABASE,)
+            if "lock_wait_timeout" in last_sql:
+                return (50,)
+            return (ALLOWED_DATABASE,)
+
+        mock_cursor.fetchone.side_effect = dynamic_fetchone
+
+        executed_sql = []
+        def fail_create_but_track(sql, *args, **kwargs):
+            sql_str = str(sql)
+            executed_sql.append(sql_str)
+            if "CREATE INDEX" in sql_str:
+                raise RuntimeError("Lost connection to MySQL server during query")
+
+        mock_cursor.execute.side_effect = fail_create_but_track
+
+        def ambiguous_get_indexes(conn, db, table):
+            import re
+            for s in executed_sql:
+                m = re.search(r"CREATE INDEX `([^`]+)`", s)
+                if m:
+                    idx_name = m.group(1)
+                    if not any("DROP INDEX" in d for d in executed_sql):
+                        return {idx_name: IndexMetadata(idx_name, "students", ["city"], False, False, "BTREE")}
+            return {}
+
+        with patch("src.evaluator.get_table_indexes", side_effect=ambiguous_get_indexes):
+            mgr = TemporaryIndexManager(
+                connection=mock_conn,
+                database_name=ALLOWED_DATABASE,
+                table_name=ALLOWED_TABLE,
+                candidate_columns=("city",),
+                allow_live_ddl=True,
+            )
+
+            with pytest.raises(EvaluationSafetyError, match="AMBIGUOUS CREATION"):
+                with mgr:
+                    pass
+
+            assert mgr.was_created is True
+            assert "AMBIGUOUS CREATION" in str(mgr.cleanup_risk)
+            drop_stmts = [s for s in executed_sql if "DROP INDEX" in s.upper()]
+            assert len(drop_stmts) == 1
 
 
 class TestParameterForwardingAndStorage:
@@ -481,16 +770,28 @@ class TestParameterForwardingAndStorage:
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value = mock_cursor
 
+        def dynamic_fetchone():
+            if not mock_cursor.execute.call_args:
+                return (ALLOWED_DATABASE,)
+            last_sql = str(mock_cursor.execute.call_args[0][0])
+            if "DATABASE()" in last_sql:
+                return (ALLOWED_DATABASE,)
+            if "lock_wait_timeout" in last_sql:
+                return (50,)
+            return (ALLOWED_DATABASE,)
+
+        mock_cursor.fetchone.side_effect = dynamic_fetchone
+
+        dynamic_get_indexes, track_ddl = make_mock_catalog_handler()
+
         def fail_on_drop(sql, *args, **kwargs):
-            if "DROP INDEX" in sql:
+            if "DROP INDEX" in str(sql):
                 raise RuntimeError("Drop failed: lock wait timeout")
+            return track_ddl(sql, *args, **kwargs)
 
         mock_cursor.execute.side_effect = fail_on_drop
-        mock_cursor.fetchone.return_value = (ALLOWED_DATABASE,)
 
-        with patch("src.evaluator.get_table_indexes") as mock_get_indexes:
-            mock_get_indexes.return_value = {}
-
+        with patch("src.evaluator.get_table_indexes", side_effect=dynamic_get_indexes):
             mgr = TemporaryIndexManager(
                 connection=mock_conn,
                 database_name=ALLOWED_DATABASE,
@@ -499,9 +800,10 @@ class TestParameterForwardingAndStorage:
                 allow_live_ddl=True,
             )
 
-            # Enter context manager (creation succeeds)
+            # Enter context manager (creation succeeds and is verified)
             mgr.__enter__()
             assert mgr.was_created is True
+            assert mgr.creation_verified is True
 
             # Exit context manager with an active evaluation exception
             simulated_eval_exc = RuntimeError("Evaluation query crashed with out-of-memory")
@@ -513,6 +815,7 @@ class TestParameterForwardingAndStorage:
             assert "Drop failed: lock wait timeout" in err_msg
             assert "Evaluation query crashed with out-of-memory" in err_msg
             assert mgr.was_cleaned_up is False
+            assert mgr.cleanup_risk is not None
 
     def test_unequal_or_error_timings_do_not_produce_delta(self) -> None:
         """When timing encounters an error, timing_delta_ms must be None and error reported."""

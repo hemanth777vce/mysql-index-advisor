@@ -222,3 +222,23 @@ class TestWorkloadContainerAndJson:
     def test_missing_json_file_raises_filenotfound(self) -> None:
         with pytest.raises(FileNotFoundError):
             load_workload_from_json("nonexistent_path_to_workload.json")
+
+    def test_sample_workload_columns_match_known_schema(self) -> None:
+        """Verify that all queries in sample_workload.json reference only valid columns in students table."""
+        from sqlglot import exp, parse_one
+
+        sample_path = os.path.join(os.path.dirname(__file__), "..", "workloads", "sample_workload.json")
+        workload = load_workload_from_json(sample_path)
+        valid_columns = {"student_id", "name", "department", "city", "cgpa"}
+
+        for query in workload.queries:
+            clean_sql = query.sql.replace("%s", "?")
+            tree = parse_one(clean_sql, read="mysql")
+            for col in tree.find_all(exp.Column):
+                col_name = col.name.lower()
+                assert col_name in valid_columns, (
+                    f"Query '{query.query_id}' references invalid column '{col_name}'"
+                )
+                assert col_name != "id", (
+                    f"Query '{query.query_id}' references obsolete column 'id'; must be 'student_id'"
+                )

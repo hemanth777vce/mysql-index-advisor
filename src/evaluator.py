@@ -104,6 +104,9 @@ class CandidateEvaluationReport:
     was_created: bool
     was_cleaned_up: bool
     cleanup_error: Optional[str]
+    creation_verified: bool = False
+    cleanup_verified: bool = False
+    cleanup_risk: Optional[str] = None
     query_results: List[QueryEvaluationResult] = field(default_factory=list)
     storage_estimate: Optional[IndexStorageEstimate] = None
     write_overhead_measured: bool = False
@@ -393,16 +396,70 @@ class TemporaryIndexManager:
         table_name: str,
         candidate_columns: Tuple[str, ...],
         allow_live_ddl: bool = False,
+        lock_wait_timeout: int = 5,
     ):
         self.connection = connection
         self.database_name = database_name
         self.table_name = table_name
         self.candidate_columns = candidate_columns
         self.allow_live_ddl = allow_live_ddl
+        self.lock_wait_timeout = lock_wait_timeout
+        self.original_lock_wait_timeout: Optional[int] = None
         self.temp_index_name: Optional[str] = None
         self.was_created: bool = False
+        self.creation_verified: bool = False
         self.was_cleaned_up: bool = False
+        self.cleanup_verified: bool = False
         self.cleanup_error: Optional[str] = None
+        self.cleanup_risk: Optional[str] = None
+
+    def _configure_lock_wait_timeout(self) -> None:
+        """Configure a short session lock_wait_timeout for DDL execution.
+
+        Raises:
+            EvaluationSafetyError: If configuring lock_wait_timeout fails.
+        """
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("SELECT @@SESSION.lock_wait_timeout")
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                try:
+                    self.original_lock_wait_timeout = int(row[0])
+                except (ValueError, TypeError):
+                    self.original_lock_wait_timeout = None
+
+            cursor.execute(f"SET SESSION lock_wait_timeout = {int(self.lock_wait_timeout)}")
+        except Exception as exc:
+            raise EvaluationSafetyError(
+                f"Failed to configure session lock_wait_timeout ({self.lock_wait_timeout}s) before DDL: {exc}"
+            ) from exc
+        finally:
+            cursor.close()
+
+    def _restore_lock_wait_timeout(self) -> None:
+        """Restore session lock_wait_timeout to original value if recorded."""
+        if self.original_lock_wait_timeout is not None:
+            try:
+                cursor = self.connection.cursor()
+                try:
+                    cursor.execute(f"SET SESSION lock_wait_timeout = {int(self.original_lock_wait_timeout)}")
+                finally:
+                    cursor.close()
+            except Exception:
+                pass  # Best-effort restoration
+
+    def _drop_temporary_index(self) -> None:
+        """Execute DROP INDEX strictly for the verified temporary index name."""
+        if not self.temp_index_name:
+            return
+        cursor = self.connection.cursor()
+        try:
+            drop_sql = f"DROP INDEX `{self.temp_index_name}` ON `{self.table_name}`"
+            cursor.execute(drop_sql)
+            self.was_cleaned_up = True
+        finally:
+            cursor.close()
 
     def __enter__(self) -> "TemporaryIndexManager":
         if not self.allow_live_ddl:
@@ -414,6 +471,10 @@ class TemporaryIndexManager:
             self.connection, self.database_name, self.table_name, self.temp_index_name
         )
 
+        # 1. Configure session-level lock_wait_timeout before any DDL
+        self._configure_lock_wait_timeout()
+
+        # 2. Execute CREATE INDEX
         cols_sql = ", ".join(f"`{validate_identifier(col, identifier_type='column name')}`" for col in self.candidate_columns)
         create_sql = f"CREATE INDEX `{self.temp_index_name}` ON `{self.table_name}` ({cols_sql})"
 
@@ -421,20 +482,67 @@ class TemporaryIndexManager:
         try:
             cursor.execute(create_sql)
             self.was_created = True
+        except Exception as create_err:
+            # Check if index exists despite reported error (ambiguous creation state)
+            try:
+                existing = get_table_indexes(self.connection, self.database_name, self.table_name)
+                if self.temp_index_name and self.temp_index_name in existing:
+                    self.was_created = True
+                    self.cleanup_risk = (
+                        f"AMBIGUOUS CREATION: CREATE INDEX reported error '{create_err}', "
+                        f"but index '{self.temp_index_name}' was found in catalog."
+                    )
+                    self._drop_temporary_index()
+            except Exception as check_err:
+                self.cleanup_risk = (
+                    f"AMBIGUOUS CREATION: CREATE INDEX failed with '{create_err}', and "
+                    f"catalog verification also failed with '{check_err}'. Index '{self.temp_index_name}' may linger."
+                )
+            self._restore_lock_wait_timeout()
+            raise EvaluationSafetyError(
+                f"Failed to create temporary index '{self.temp_index_name}': {create_err}. Risk: {self.cleanup_risk or 'None'}"
+            ) from create_err
         finally:
             cursor.close()
+
+        # 3. Post-creation verification
+        try:
+            existing = get_table_indexes(self.connection, self.database_name, self.table_name)
+            if not self.temp_index_name or self.temp_index_name not in existing:
+                raise EvaluationSafetyError(
+                    f"Post-creation verification failed: index '{self.temp_index_name}' not found in catalog on table '{self.table_name}'."
+                )
+            idx_meta = existing[self.temp_index_name]
+            found_cols = tuple(idx_meta.columns)
+            if found_cols != tuple(self.candidate_columns):
+                raise EvaluationSafetyError(
+                    f"Post-creation column verification failed: index '{self.temp_index_name}' has columns {found_cols}, expected {self.candidate_columns}."
+                )
+            self.creation_verified = True
+        except Exception as verify_err:
+            # Index was created in MySQL but failed verification -> must attempt cleanup
+            try:
+                self._drop_temporary_index()
+            except Exception as drop_err:
+                self.cleanup_error = f"Cleanup failed after verification failure: {drop_err}. (Verification error: {verify_err})"
+                self.cleanup_risk = self.cleanup_error
+                self._restore_lock_wait_timeout()
+                raise EvaluationCleanupError(self.cleanup_error) from drop_err
+
+            self._restore_lock_wait_timeout()
+            raise EvaluationSafetyError(
+                f"Temporary index creation verification failed: {verify_err}. Index was cleaned up."
+            ) from verify_err
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         if not self.was_created or not self.temp_index_name:
+            self._restore_lock_wait_timeout()
             return False
 
-        cursor = self.connection.cursor()
         try:
-            drop_sql = f"DROP INDEX `{self.temp_index_name}` ON `{self.table_name}`"
-            cursor.execute(drop_sql)
-            self.was_cleaned_up = True
+            self._drop_temporary_index()
         except Exception as drop_err:
             if exc_val is not None:
                 self.cleanup_error = (
@@ -446,9 +554,36 @@ class TemporaryIndexManager:
                     f"CLEANUP FAILURE: Failed to drop temporary index '{self.temp_index_name}' "
                     f"from table '{self.table_name}': {drop_err}"
                 )
+            self.cleanup_risk = self.cleanup_error
+            self._restore_lock_wait_timeout()
             raise EvaluationCleanupError(self.cleanup_error) from drop_err
         finally:
-            cursor.close()
+            self._restore_lock_wait_timeout()
+
+        # Post-drop verification: confirm temporary index is absent
+        eval_suffix = f" (Evaluation also failed with: {exc_val})" if exc_val is not None else ""
+        try:
+            indexes_after_drop = get_table_indexes(
+                self.connection, self.database_name, self.table_name
+            )
+            if self.temp_index_name in indexes_after_drop:
+                self.cleanup_error = (
+                    f"CLEANUP VERIFICATION FAILURE: Temporary index '{self.temp_index_name}' "
+                    f"is still present in catalog on table '{self.table_name}' after DROP INDEX.{eval_suffix}"
+                )
+                self.cleanup_risk = self.cleanup_error
+                self.was_cleaned_up = False
+                raise EvaluationCleanupError(self.cleanup_error)
+            self.cleanup_verified = True
+        except EvaluationCleanupError:
+            raise
+        except Exception as verify_err:
+            self.cleanup_error = (
+                f"CLEANUP VERIFICATION FAILED TO CONFIRM REMOVAL: Could not verify removal of '{self.temp_index_name}': {verify_err}.{eval_suffix}"
+            )
+            self.cleanup_risk = self.cleanup_error
+            self.was_cleaned_up = False
+            raise EvaluationCleanupError(self.cleanup_error) from verify_err
 
         return False
 
@@ -553,6 +688,7 @@ def evaluate_candidate_index(
             ) as mgr:
                 report.temporary_index_name = mgr.temp_index_name
                 report.was_created = mgr.was_created
+                report.creation_verified = mgr.creation_verified
 
                 for q in queries:
                     verify_target_safety(connection, database_name, table_name)
@@ -604,15 +740,22 @@ def evaluate_candidate_index(
                     )
 
             report.was_cleaned_up = mgr.was_cleaned_up
+            report.cleanup_verified = mgr.cleanup_verified
             report.cleanup_error = mgr.cleanup_error
+            report.cleanup_risk = mgr.cleanup_risk
             report.summary_note = (
                 f"Live evaluation completed successfully. Temporary index '{mgr.temp_index_name}' "
-                f"was safely created, evaluated, and dropped."
+                f"was safely created, verified, evaluated, and dropped."
             )
         except Exception:
             if "mgr" in locals():
+                report.temporary_index_name = mgr.temp_index_name
+                report.was_created = mgr.was_created
+                report.creation_verified = mgr.creation_verified
                 report.was_cleaned_up = mgr.was_cleaned_up
+                report.cleanup_verified = mgr.cleanup_verified
                 report.cleanup_error = mgr.cleanup_error
+                report.cleanup_risk = mgr.cleanup_risk
             raise
 
     finally:
