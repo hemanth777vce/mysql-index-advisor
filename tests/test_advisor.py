@@ -227,7 +227,10 @@ class TestWorkflowOrchestration:
                 mode="dry_run",
                 temporary_index_name=None,
                 was_created=False,
-                was_cleaned_up=False,
+                creation_verified=None,
+                was_cleaned_up=None,
+                cleanup_verified=None,
+                cleanup_status="NOT_APPLICABLE",
                 cleanup_error=None,
                 query_results=[],
             )
@@ -245,9 +248,13 @@ class TestWorkflowOrchestration:
         )
 
         assert report.mode == "dry_run"
+        assert report.cleanup_status == "NOT_APPLICABLE"
+        assert report.cleanup_verified is None
         assert len(report.recommendations) == 2
         assert report.recommendations[0].candidate.columns == ("city",)
+        assert report.recommendations[0].confidence == "HEURISTIC"
         assert report.recommendations[1].candidate.columns == ("department", "city")
+        assert report.recommendations[1].confidence == "HEURISTIC"
 
         # Verify evaluate_candidate_index was called with allow_live_ddl=False
         for call_args in mock_eval.call_args_list:
@@ -285,6 +292,7 @@ class TestWorkflowOrchestration:
             creation_verified=True,
             was_cleaned_up=True,
             cleanup_verified=True,
+            cleanup_status="VERIFIED",
             cleanup_error=None,
             query_results=[],
         )
@@ -299,7 +307,9 @@ class TestWorkflowOrchestration:
         )
 
         assert report.mode == "live"
+        assert report.cleanup_status == "VERIFIED"
         assert report.cleanup_verified is True
+        assert report.recommendations[0].confidence == "EXPERIMENTAL"
         # Verify evaluate_candidate_index was called with allow_live_ddl=True
         assert mock_eval.call_args[1]["allow_live_ddl"] is True
 
@@ -468,6 +478,7 @@ class TestVerdictAndReporting:
             existing_indexes=["PRIMARY"],
             existing_redundancies=[],
             recommendations=[rec],
+            cleanup_status="CLEANUP_FAILED",
             cleanup_verified=False,
             cleanup_error="Lock wait timeout during DROP INDEX",
             cleanup_risk="Index 'tmp_adv_city_12345678' may linger",
@@ -498,7 +509,8 @@ class TestCliExecutionMocked:
             existing_indexes=["PRIMARY"],
             existing_redundancies=[],
             recommendations=[],
-            cleanup_verified=True,
+            cleanup_status="NOT_APPLICABLE",
+            cleanup_verified=None,
         )
         mock_run.return_value = report
 
@@ -522,6 +534,7 @@ class TestCliExecutionMocked:
             existing_indexes=["PRIMARY"],
             existing_redundancies=[],
             recommendations=[],
+            cleanup_status="CLEANUP_FAILED",
             cleanup_verified=False,
             cleanup_error="DROP failed",
         )
@@ -539,3 +552,445 @@ class TestCliExecutionMocked:
         captured = capsys.readouterr()
         assert "YES_SECRET_PASS" not in captured.err
         assert "Database connection error" in captured.err
+
+
+class TestDryRunClarityAndDemoReadiness:
+    """Milestone 9A: Verify dry-run report clarity and safety semantics."""
+
+    @patch("src.advisor.evaluate_candidate_index")
+    @patch("src.advisor.generate_candidate_indexes_for_table")
+    @patch("src.advisor.introspect_table")
+    @patch("src.advisor.load_workload_from_json")
+    def test_dry_run_cleanup_marked_not_applicable(
+        self,
+        mock_load_wl: MagicMock,
+        mock_introspect: MagicMock,
+        mock_generate: MagicMock,
+        mock_eval: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = (ALLOWED_DATABASE,)
+
+        mock_load_wl.return_value = make_mock_workload()
+        mock_introspect.return_value = make_mock_table_metadata()
+
+        c1 = CandidateIndex("students", ("city",), "idx_students_city", 400.0, ["q_city"], "CREATE ...", "")
+        mock_generate.return_value = [c1]
+
+        mock_eval.return_value = CandidateEvaluationReport(
+            candidate=c1,
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            mode="dry_run",
+            temporary_index_name=None,
+            was_created=False,
+            creation_verified=None,
+            was_cleaned_up=None,
+            cleanup_verified=None,
+            cleanup_status="NOT_APPLICABLE",
+            cleanup_error=None,
+            cleanup_risk=None,
+            query_results=[
+                QueryEvaluationResult(
+                    query_id="q_city",
+                    sql="SELECT ...",
+                    parameters=(),
+                    weight=250.0,
+                    baseline_plan=OptimizerPlanMetrics(query_cost=500.0, access_type="ALL"),
+                    candidate_plan=None,
+                )
+            ],
+        )
+
+        report = run_advisor(
+            connection=mock_conn,
+            workload_path="workloads/sample_workload.json",
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            allow_live_ddl=False,
+            max_candidates=1,
+        )
+
+        assert report.mode == "dry_run"
+        assert report.cleanup_status == "NOT_APPLICABLE"
+        assert report.cleanup_verified is None
+        assert report.cleanup_error is None
+        assert report.cleanup_risk is None
+
+        # Verify candidate evaluation object semantics
+        rec = report.recommendations[0]
+        assert rec.confidence == "HEURISTIC"
+        assert rec.evaluation_report is not None
+        assert rec.evaluation_report.was_created is False
+        assert rec.evaluation_report.creation_verified is None
+        assert rec.evaluation_report.was_cleaned_up is None
+        assert rec.evaluation_report.cleanup_verified is None
+        assert rec.evaluation_report.cleanup_status == "NOT_APPLICABLE"
+
+        # Verify JSON serialization
+        d = report.to_dict()
+        assert d["safety_status"]["cleanup_status"] == "NOT_APPLICABLE"
+        assert d["safety_status"]["cleanup_verified"] is None
+        assert d["safety_status"]["cleanup_error"] is None
+        assert d["safety_status"]["cleanup_risk"] is None
+        assert d["recommendations"][0]["confidence"] == "HEURISTIC"
+        eval_dict = d["recommendations"][0]["evaluation"]
+        assert eval_dict["was_created"] is False
+        assert eval_dict["creation_verified"] is None
+        assert eval_dict["was_cleaned_up"] is None
+        assert eval_dict["cleanup_verified"] is None
+        assert eval_dict["cleanup_status"] == "NOT_APPLICABLE"
+
+        # Verify Text formatting
+        text = format_text_report(report)
+        assert "Safety Status: Clean. Dry-run mode: zero DDL executed; temporary objects not applicable." in text
+        assert "CRITICAL SAFETY WARNING" not in text
+
+    @patch("src.advisor.evaluate_candidate_index")
+    @patch("src.advisor.generate_candidate_indexes_for_table")
+    @patch("src.advisor.introspect_table")
+    @patch("src.advisor.load_workload_from_json")
+    def test_live_successful_cleanup_remaining_verified(
+        self,
+        mock_load_wl: MagicMock,
+        mock_introspect: MagicMock,
+        mock_generate: MagicMock,
+        mock_eval: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = (ALLOWED_DATABASE,)
+
+        mock_load_wl.return_value = make_mock_workload()
+        mock_introspect.return_value = make_mock_table_metadata()
+
+        c1 = CandidateIndex("students", ("city",), "idx_students_city", 400.0, ["q_city"], "CREATE ...", "")
+        mock_generate.return_value = [c1]
+
+        mock_eval.return_value = CandidateEvaluationReport(
+            candidate=c1,
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            mode="live",
+            temporary_index_name="tmp_adv_city_12345678",
+            was_created=True,
+            creation_verified=True,
+            was_cleaned_up=True,
+            cleanup_verified=True,
+            cleanup_status="VERIFIED",
+            cleanup_error=None,
+            cleanup_risk=None,
+            query_results=[
+                QueryEvaluationResult(
+                    query_id="q_city",
+                    sql="SELECT ...",
+                    parameters=(),
+                    weight=250.0,
+                    baseline_plan=OptimizerPlanMetrics(query_cost=500.0, access_type="ALL"),
+                    candidate_plan=OptimizerPlanMetrics(query_cost=100.0, access_type="ref", key_used="tmp_adv_city_12345678"),
+                    cost_delta=400.0,
+                    timing_delta_ms=5.0,
+                )
+            ],
+        )
+
+        report = run_advisor(
+            connection=mock_conn,
+            workload_path="workloads/sample_workload.json",
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            allow_live_ddl=True,
+            max_candidates=1,
+        )
+
+        assert report.mode == "live"
+        assert report.cleanup_status == "VERIFIED"
+        assert report.cleanup_verified is True
+        assert report.cleanup_error is None
+
+        # Verify JSON
+        d = report.to_dict()
+        assert d["safety_status"]["cleanup_status"] == "VERIFIED"
+        assert d["safety_status"]["cleanup_verified"] is True
+        assert d["recommendations"][0]["confidence"] == "EXPERIMENTAL"
+        eval_dict = d["recommendations"][0]["evaluation"]
+        assert eval_dict["was_created"] is True
+        assert eval_dict["creation_verified"] is True
+        assert eval_dict["was_cleaned_up"] is True
+        assert eval_dict["cleanup_verified"] is True
+        assert eval_dict["cleanup_status"] == "VERIFIED"
+
+        # Verify Text
+        text = format_text_report(report)
+        assert "Safety Status: Clean. All temporary objects verified absent; baseline schema preserved." in text
+
+    @patch("src.advisor.evaluate_candidate_index")
+    @patch("src.advisor.generate_candidate_indexes_for_table")
+    @patch("src.advisor.introspect_table")
+    @patch("src.advisor.load_workload_from_json")
+    def test_live_cleanup_failure_and_risk_remaining_visible(
+        self,
+        mock_load_wl: MagicMock,
+        mock_introspect: MagicMock,
+        mock_generate: MagicMock,
+        mock_eval: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = (ALLOWED_DATABASE,)
+
+        mock_load_wl.return_value = make_mock_workload()
+        mock_introspect.return_value = make_mock_table_metadata()
+
+        c1 = CandidateIndex("students", ("city",), "idx_students_city", 400.0, ["q_city"], "CREATE ...", "")
+        mock_generate.return_value = [c1]
+
+        mock_eval.return_value = CandidateEvaluationReport(
+            candidate=c1,
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            mode="live",
+            temporary_index_name="tmp_adv_city_12345678",
+            was_created=True,
+            creation_verified=True,
+            was_cleaned_up=False,
+            cleanup_verified=False,
+            cleanup_status="CLEANUP_FAILED",
+            cleanup_error="Lock wait timeout during DROP INDEX",
+            cleanup_risk="Index 'tmp_adv_city_12345678' may linger in catalog",
+            query_results=[],
+        )
+
+        report = run_advisor(
+            connection=mock_conn,
+            workload_path="workloads/sample_workload.json",
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            allow_live_ddl=True,
+            max_candidates=1,
+        )
+
+        assert report.cleanup_status == "CLEANUP_FAILED"
+        assert report.cleanup_verified is False
+        assert report.cleanup_error == "Lock wait timeout during DROP INDEX"
+        assert report.cleanup_risk == "Index 'tmp_adv_city_12345678' may linger in catalog"
+
+        # Verify JSON
+        d = report.to_dict()
+        assert d["safety_status"]["cleanup_status"] == "CLEANUP_FAILED"
+        assert d["safety_status"]["cleanup_verified"] is False
+        assert d["safety_status"]["cleanup_error"] == "Lock wait timeout during DROP INDEX"
+        assert d["safety_status"]["cleanup_risk"] == "Index 'tmp_adv_city_12345678' may linger in catalog"
+        eval_dict = d["recommendations"][0]["evaluation"]
+        assert eval_dict["was_cleaned_up"] is False
+        assert eval_dict["cleanup_verified"] is False
+        assert eval_dict["cleanup_status"] == "CLEANUP_FAILED"
+
+        # Verify Text
+        text = format_text_report(report)
+        assert "CRITICAL SAFETY WARNING: UNVERIFIED INDEX CLEANUP" in text
+        assert "Lock wait timeout during DROP INDEX" in text
+        assert "Index 'tmp_adv_city_12345678' may linger in catalog" in text
+
+    @patch("src.advisor.evaluate_candidate_index")
+    @patch("src.advisor.generate_candidate_indexes_for_table")
+    @patch("src.advisor.introspect_table")
+    @patch("src.advisor.load_workload_from_json")
+    def test_dry_run_recommendations_do_not_claim_measured_gains(
+        self,
+        mock_load_wl: MagicMock,
+        mock_introspect: MagicMock,
+        mock_generate: MagicMock,
+        mock_eval: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = (ALLOWED_DATABASE,)
+
+        mock_load_wl.return_value = make_mock_workload()
+        mock_introspect.return_value = make_mock_table_metadata()
+
+        c1 = CandidateIndex("students", ("city",), "idx_students_city", 400.0, ["q_city"], "CREATE ...", "")
+        mock_generate.return_value = [c1]
+
+        mock_eval.return_value = CandidateEvaluationReport(
+            candidate=c1,
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            mode="dry_run",
+            temporary_index_name=None,
+            was_created=False,
+            creation_verified=None,
+            was_cleaned_up=None,
+            cleanup_verified=None,
+            cleanup_status="NOT_APPLICABLE",
+            cleanup_error=None,
+            cleanup_risk=None,
+            query_results=[
+                QueryEvaluationResult(
+                    query_id="q_city",
+                    sql="SELECT ...",
+                    parameters=(),
+                    weight=250.0,
+                    baseline_plan=OptimizerPlanMetrics(query_cost=500.0, access_type="ALL"),
+                    baseline_timing=TimingMetrics(median_ms=10.0),
+                    candidate_plan=None,
+                    candidate_timing=None,
+                    cost_delta=None,
+                    rows_delta=None,
+                    timing_delta_ms=None,
+                )
+            ],
+        )
+
+        report = run_advisor(
+            connection=mock_conn,
+            workload_path="workloads/sample_workload.json",
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            allow_live_ddl=False,
+            max_candidates=1,
+        )
+
+        rec = report.recommendations[0]
+        assert rec.confidence == "HEURISTIC"
+        assert "Heuristic candidate proposal based on query patterns" in rec.verdict_reason
+        assert "controlled live evaluation required to measure empirical optimizer selection and speedup" in rec.verdict_reason
+        assert "Selected by MySQL optimizer" not in rec.verdict_reason
+
+        # Ensure query results have NO measured gains
+        qr = rec.evaluation_report.query_results[0]
+        assert qr.candidate_plan is None
+        assert qr.candidate_timing is None
+        assert qr.cost_delta is None
+        assert qr.rows_delta is None
+        assert qr.timing_delta_ms is None
+
+        text = format_text_report(report)
+        assert "Candidate speedups and optimizer selections are NOT claimed in dry-run." in text
+        assert "Confidence        : HEURISTIC (Workload pattern analysis; not experimentally measured)" in text
+
+    def test_json_serialization_valid_with_cleanup_semantics(self) -> None:
+        candidate = CandidateIndex("students", ("city",), "idx_city", 400.0, ["q_city"], "CREATE ...", "")
+        dry_eval = CandidateEvaluationReport(
+            candidate=candidate,
+            table_name="students",
+            database_name=ALLOWED_DATABASE,
+            mode="dry_run",
+            temporary_index_name=None,
+            was_created=False,
+            creation_verified=None,
+            was_cleaned_up=None,
+            cleanup_verified=None,
+            cleanup_status="NOT_APPLICABLE",
+            cleanup_error=None,
+            cleanup_risk=None,
+        )
+        rec = CandidateRecommendation(
+            rank=1,
+            candidate=candidate,
+            verdict="RECOMMENDED",
+            confidence="HEURISTIC",
+            verdict_reason="Heuristic recommendation.",
+            storage_estimate_bytes=100000,
+            storage_estimate_kb=97.6,
+            illustrative_ddl="CREATE INDEX ...",
+            evaluation_report=dry_eval,
+        )
+        report = AdvisorReport(
+            database=ALLOWED_DATABASE,
+            table=ALLOWED_TABLE,
+            row_count=10008,
+            mode="dry_run",
+            workload_name="TestWL",
+            workload_query_count=1,
+            existing_indexes=["PRIMARY"],
+            existing_redundancies=[],
+            recommendations=[rec],
+            cleanup_status="NOT_APPLICABLE",
+            cleanup_verified=None,
+        )
+
+        # Roundtrip JSON
+        payload = json.dumps(report.to_dict(), indent=2)
+        parsed = json.loads(payload)
+
+        assert parsed["target"]["mode"] == "dry_run"
+        assert parsed["safety_status"]["cleanup_status"] == "NOT_APPLICABLE"
+        assert parsed["safety_status"]["cleanup_verified"] is None
+        rec_parsed = parsed["recommendations"][0]
+        assert rec_parsed["confidence"] == "HEURISTIC"
+        assert rec_parsed["evaluation"]["cleanup_status"] == "NOT_APPLICABLE"
+        assert rec_parsed["evaluation"]["cleanup_verified"] is None
+        assert rec_parsed["evaluation"]["was_cleaned_up"] is None
+        assert rec_parsed["evaluation"]["was_created"] is False
+
+    @patch("src.advisor.evaluate_candidate_index")
+    @patch("src.advisor.generate_candidate_indexes_for_table")
+    @patch("src.advisor.introspect_table")
+    @patch("src.advisor.load_workload_from_json")
+    def test_live_mode_without_created_index_does_not_claim_experimental_confidence(
+        self,
+        mock_load_wl: MagicMock,
+        mock_introspect: MagicMock,
+        mock_generate: MagicMock,
+        mock_eval: MagicMock,
+    ) -> None:
+        """When live mode is requested but index creation failed or was aborted, candidate must remain HEURISTIC."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = (ALLOWED_DATABASE,)
+
+        mock_load_wl.return_value = make_mock_workload()
+        mock_introspect.return_value = make_mock_table_metadata()
+
+        c1 = CandidateIndex("students", ("city",), "idx_students_city", 400.0, ["q_city"], "CREATE ...", "")
+        mock_generate.return_value = [c1]
+
+        # Candidate report where creation failed
+        mock_eval.return_value = CandidateEvaluationReport(
+            candidate=c1,
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            mode="live",
+            temporary_index_name="tmp_adv_city_12345678",
+            was_created=False,
+            creation_verified=False,
+            was_cleaned_up=None,
+            cleanup_verified=None,
+            cleanup_status="NOT_APPLICABLE",
+            cleanup_error=None,
+            cleanup_risk=None,
+            query_results=[
+                QueryEvaluationResult(
+                    query_id="q_city",
+                    sql="SELECT ...",
+                    parameters=(),
+                    weight=250.0,
+                    baseline_plan=OptimizerPlanMetrics(query_cost=500.0, access_type="ALL"),
+                    candidate_plan=None,
+                )
+            ],
+        )
+
+        report = run_advisor(
+            connection=mock_conn,
+            workload_path="workloads/sample_workload.json",
+            table_name=ALLOWED_TABLE,
+            database_name=ALLOWED_DATABASE,
+            allow_live_ddl=True,
+            max_candidates=1,
+        )
+
+        rec = report.recommendations[0]
+        # Must NOT be EXPERIMENTAL because the index was never created/measured
+        assert rec.confidence == "HEURISTIC"
+        # Verdict must NOT claim optimizer evaluated it
+        assert "Evaluated with live temporary index" not in rec.verdict_reason
+        assert "Heuristic candidate proposal based on query patterns" in rec.verdict_reason

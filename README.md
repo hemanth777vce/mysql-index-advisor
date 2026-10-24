@@ -52,6 +52,23 @@ The database connection manager automatically resolves credentials from `.env` o
 
 The unified advisor CLI can be run directly using Python's module syntax:
 
+### Recommended Demonstration Commands (Safe Dry-Run Only)
+
+To run the demonstration safely without executing any DDL:
+
+```bash
+# 1. Standard human-readable terminal report (safe dry-run)
+python -m src.advisor
+
+# 2. Structured machine-readable JSON report (safe dry-run)
+python -m src.advisor --json
+
+# 3. CLI usage and help options
+python -m src.advisor --help
+```
+
+---
+
 ### A. Dry-Run Evaluation (Default & Recommended)
 
 ```bash
@@ -71,9 +88,18 @@ python -m src.advisor --workload workloads/sample_workload.json
 - Does **not** create indexes or measure candidate query timings.
 - Does **not** claim candidate speedups or predict whether the MySQL optimizer will definitively select the candidate index over existing indexes.
 
+#### Meaning of Dry-Run Cleanup Status
+Because dry-run mode executes zero DDL and creates no temporary indexes, index cleanup is **not applicable**:
+- In the top-level `safety_status`: `cleanup_status` is `"NOT_APPLICABLE"` and `cleanup_verified` is `null` (`None`).
+- In each candidate `evaluation`: `was_created` is `false`, while `creation_verified`, `was_cleaned_up`, and `cleanup_verified` are `null` (`None`) with `cleanup_status: "NOT_APPLICABLE"`.
+- This clearly distinguishes "cleanup not applicable because no temporary index was created" from a cleanup failure, ensuring reports are accurate without weakening safety checks.
+
 ---
 
 ### B. Live Temporary-Index Evaluation (`--live`)
+
+> [!WARNING]
+> `--live` is an advanced opt-in flag that performs real DDL on MySQL! When `--live` is specified, the advisor creates and subsequently drops a uniquely named temporary index on the explicitly permitted target table (`index_advisor_test.students`). Live evaluation should only be run after reviewing dry-run recommendations.
 
 Live evaluation enables empirical before-and-after testing of candidate indexes:
 
@@ -120,16 +146,16 @@ Options:
   --json                 Emit report as structured JSON (default: False)
 ```
 
-#### Structured JSON Output Example
-
-```bash
-python -m src.advisor --json
-```
-
 ---
 
-## 4. Report Interpretation and Recommendation Verdicts
+## 4. Report Interpretation, Recommendation Confidence, and Schema Semantics
 
+### Recommendation Confidence Levels
+Each candidate index recommendation is classified with an explicit confidence level:
+- **`confidence: "HEURISTIC"`** (Dry-run mode): The candidate is proposed based on SQL AST query predicate matching, workload execution frequency weights, and B-Tree prefix heuristics. Dry-run mode **never claims measured performance gains or empirical speedups**. Controlled live evaluation is required to confirm optimizer selection and empirical latency improvement.
+- **`confidence: "EXPERIMENTAL"`** (Live mode): The candidate was empirically tested by creating a temporary index. MySQL optimizer selection (`key_used`) and query cost/latency deltas were verified directly from MySQL.
+
+### Recommendation Verdicts
 The advisor assigns one of three verdicts to each candidate:
 
 - **`RECOMMENDED`**:
@@ -143,6 +169,59 @@ The advisor assigns one of three verdicts to each candidate:
 
 > **Note on DDL in Reports**: All generated `CREATE INDEX` statements in the report are illustrative and labeled `[ILLUSTRATIVE DDL — NOT EXECUTED]`. The report formatter never executes DDL.
 
+### JSON Schema Specification
+When `--json` is supplied, the advisor outputs structured JSON:
+
+```json
+{
+  "target": {
+    "database": "index_advisor_test",
+    "table": "students",
+    "row_count": 10008,
+    "mode": "dry_run"
+  },
+  "workload": {
+    "name": "StudentsWorkload",
+    "query_count": 4
+  },
+  "existing_indexes": ["PRIMARY", "idx_students_department"],
+  "existing_redundancies": [],
+  "safety_status": {
+    "cleanup_status": "NOT_APPLICABLE",
+    "cleanup_verified": null,
+    "cleanup_error": null,
+    "cleanup_risk": null
+  },
+  "recommendations": [
+    {
+      "rank": 1,
+      "table_name": "students",
+      "columns": ["city", "department"],
+      "heuristic_score": 875.0,
+      "supporting_query_ids": ["dept_city_lookup", "city_lookup", "city_dept_lookup"],
+      "storage_estimate_bytes": 685020,
+      "storage_estimate_kb": 668.96,
+      "verdict": "RECOMMENDED",
+      "confidence": "HEURISTIC",
+      "verdict_reason": "Workload analysis targets full table scan in queries: city_lookup. (Heuristic candidate proposal based on query patterns; controlled live evaluation required to measure empirical optimizer selection and speedup).",
+      "illustrative_ddl": "CREATE INDEX `idx_students_city_department` ON `students` (`city`, `department`);",
+      "evaluation": {
+        "mode": "dry_run",
+        "temporary_index_name": null,
+        "was_created": false,
+        "creation_verified": null,
+        "was_cleaned_up": null,
+        "cleanup_verified": null,
+        "cleanup_status": "NOT_APPLICABLE",
+        "cleanup_error": null,
+        "cleanup_risk": null,
+        "query_results": [...]
+      }
+    }
+  ]
+}
+```
+
 ---
 
 ## 5. Running the Test Suite
@@ -150,7 +229,7 @@ The advisor assigns one of three verdicts to each candidate:
 All tests are fully mocked and run offline without connecting to a live MySQL instance:
 
 ```bash
-# Run complete test suite (144 tests)
+# Run complete test suite (150 tests)
 python -m pytest
 
 # Run with verbose output
@@ -163,4 +242,4 @@ python -m pytest -v
 - `tests/test_workload.py`: Workload parsing, AST query validation, unsupported SQL rejection.
 - `tests/test_candidate_generator.py`: B-Tree prefix heuristics, scoring algorithms, redundancy pruning.
 - `tests/test_evaluator.py`: Cost evaluation, latency measurement, lock-wait timeout, temporary index verification and cleanup.
-- `tests/test_advisor.py`: End-to-end CLI orchestration, target gating, dry-run/live workflows, report formatting, cleanup failure detection.
+- `tests/test_advisor.py`: End-to-end CLI orchestration, target gating, dry-run/live workflows, report formatting, cleanup failure detection, confidence semantics.

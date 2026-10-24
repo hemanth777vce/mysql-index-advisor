@@ -102,11 +102,12 @@ class CandidateEvaluationReport:
     mode: str  # "dry_run" or "live"
     temporary_index_name: Optional[str]
     was_created: bool
-    was_cleaned_up: bool
-    cleanup_error: Optional[str]
-    creation_verified: bool = False
-    cleanup_verified: bool = False
+    was_cleaned_up: Optional[bool] = None
+    cleanup_error: Optional[str] = None
+    creation_verified: Optional[bool] = None
+    cleanup_verified: Optional[bool] = None
     cleanup_risk: Optional[str] = None
+    cleanup_status: str = "NOT_APPLICABLE"
     query_results: List[QueryEvaluationResult] = field(default_factory=list)
     storage_estimate: Optional[IndexStorageEstimate] = None
     write_overhead_measured: bool = False
@@ -631,7 +632,10 @@ def evaluate_candidate_index(
         mode=mode_label,
         temporary_index_name=None,
         was_created=False,
-        was_cleaned_up=False,
+        creation_verified=None,
+        was_cleaned_up=None,
+        cleanup_verified=None,
+        cleanup_status="NOT_APPLICABLE",
         cleanup_error=None,
         storage_estimate=storage_est,
     )
@@ -743,6 +747,7 @@ def evaluate_candidate_index(
             report.cleanup_verified = mgr.cleanup_verified
             report.cleanup_error = mgr.cleanup_error
             report.cleanup_risk = mgr.cleanup_risk
+            report.cleanup_status = "VERIFIED" if mgr.cleanup_verified else "CLEANUP_FAILED"
             report.summary_note = (
                 f"Live evaluation completed successfully. Temporary index '{mgr.temp_index_name}' "
                 f"was safely created, verified, evaluated, and dropped."
@@ -756,6 +761,12 @@ def evaluate_candidate_index(
                 report.cleanup_verified = mgr.cleanup_verified
                 report.cleanup_error = mgr.cleanup_error
                 report.cleanup_risk = mgr.cleanup_risk
+                if mgr.cleanup_verified:
+                    report.cleanup_status = "VERIFIED"
+                elif mgr.was_created:
+                    report.cleanup_status = "CLEANUP_FAILED"
+                else:
+                    report.cleanup_status = "NOT_APPLICABLE"
             raise
 
     finally:

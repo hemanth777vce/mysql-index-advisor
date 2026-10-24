@@ -262,7 +262,10 @@ class TestDryRunEvaluation:
 
         assert report.mode == "dry_run"
         assert report.was_created is False
-        assert report.was_cleaned_up is False
+        assert report.creation_verified is None
+        assert report.was_cleaned_up is None
+        assert report.cleanup_verified is None
+        assert report.cleanup_status == "NOT_APPLICABLE"
         assert "No DDL was executed" in report.summary_note
 
         # Verify NO 'CREATE INDEX' or 'DROP INDEX' commands were sent to cursor
@@ -312,6 +315,7 @@ class TestLiveLifecycleAndGuaranteedCleanup:
             assert report.creation_verified is True
             assert report.was_cleaned_up is True
             assert report.cleanup_verified is True
+            assert report.cleanup_status == "VERIFIED"
             assert report.cleanup_error is None
             assert report.cleanup_risk is None
 

@@ -1,4 +1,4 @@
-﻿"""Unified MySQL Index Advisor CLI and Workflow Orchestrator.
+"""Unified MySQL Index Advisor CLI and Workflow Orchestrator.
 
 Orchestrates the complete index recommendation workflow:
 1. Workload loading and AST query validation.
@@ -62,6 +62,7 @@ class CandidateRecommendation:
     storage_estimate_bytes: Optional[int]
     storage_estimate_kb: Optional[float]
     illustrative_ddl: str
+    confidence: str = "HEURISTIC"  # "HEURISTIC" or "EXPERIMENTAL"
     evaluation_report: Optional[CandidateEvaluationReport] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -75,6 +76,7 @@ class CandidateRecommendation:
                 "creation_verified": self.evaluation_report.creation_verified,
                 "was_cleaned_up": self.evaluation_report.was_cleaned_up,
                 "cleanup_verified": self.evaluation_report.cleanup_verified,
+                "cleanup_status": self.evaluation_report.cleanup_status,
                 "cleanup_error": self.evaluation_report.cleanup_error,
                 "cleanup_risk": self.evaluation_report.cleanup_risk,
                 "query_results": [
@@ -116,6 +118,7 @@ class CandidateRecommendation:
             "storage_estimate_bytes": self.storage_estimate_bytes,
             "storage_estimate_kb": self.storage_estimate_kb,
             "verdict": self.verdict,
+            "confidence": self.confidence,
             "verdict_reason": self.verdict_reason,
             "illustrative_ddl": self.illustrative_ddl,
             "evaluation": eval_dict,
@@ -135,7 +138,8 @@ class AdvisorReport:
     existing_indexes: List[str]
     existing_redundancies: List[str]
     recommendations: List[CandidateRecommendation] = field(default_factory=list)
-    cleanup_verified: bool = True
+    cleanup_status: str = "NOT_APPLICABLE"
+    cleanup_verified: Optional[bool] = None
     cleanup_error: Optional[str] = None
     cleanup_risk: Optional[str] = None
     summary_note: str = ""
@@ -156,6 +160,7 @@ class AdvisorReport:
             "existing_indexes": self.existing_indexes,
             "existing_redundancies": self.existing_redundancies,
             "safety_status": {
+                "cleanup_status": self.cleanup_status,
                 "cleanup_verified": self.cleanup_verified,
                 "cleanup_error": self.cleanup_error,
                 "cleanup_risk": self.cleanup_risk,
@@ -176,7 +181,7 @@ def determine_verdict(
         Tuple of (verdict, verdict_reason) where verdict is
         'RECOMMENDED', 'NEUTRAL', or 'NOT RECOMMENDED'.
     """
-    if allow_live_ddl and eval_report and eval_report.query_results:
+    if allow_live_ddl and eval_report and eval_report.mode == "live" and eval_report.was_created and eval_report.query_results:
         # Check if the temporary index was actually selected by the MySQL optimizer
         temp_name = eval_report.temporary_index_name
         selected_queries = [
@@ -219,14 +224,14 @@ def determine_verdict(
             return (
                 "RECOMMENDED",
                 f"Workload analysis targets full table scan in queries: {', '.join(scanned_queries)}. "
-                f"(Dry-run heuristic proposal; live evaluation recommended to verify optimizer selection).",
+                f"(Heuristic candidate proposal based on query patterns; controlled live evaluation required to measure empirical optimizer selection and speedup).",
             )
 
     if candidate.score > 0:
         return (
             "RECOMMENDED",
             f"Workload equality filters match candidate columns with positive utility score ({candidate.score:.1f}). "
-            f"(Dry-run heuristic proposal; live evaluation recommended to verify optimizer selection).",
+            f"(Heuristic candidate proposal based on query patterns; controlled live evaluation required to measure empirical optimizer selection and speedup).",
         )
 
     return (
@@ -265,6 +270,7 @@ def format_text_report(report: AdvisorReport) -> str:
     if report.mode == "dry_run":
         lines.append("[NOTE] Dry-run mode evaluates baseline metrics, storage, and heuristic fit.")
         lines.append("       Candidate speedups and optimizer selections are NOT claimed in dry-run.")
+        lines.append("       Controlled live evaluation is required to measure empirical performance gains.")
     else:
         lines.append("[NOTE] Live mode evaluated candidate indexes using session-isolated temporary")
         lines.append("       indexes with guaranteed lifecycle verification and cleanup.")
@@ -280,8 +286,17 @@ def format_text_report(report: AdvisorReport) -> str:
         for rec in report.recommendations:
             col_str = ", ".join(f"`{c}`" for c in rec.candidate.columns)
             storage_str = f"~{rec.storage_estimate_kb:.1f} KB" if rec.storage_estimate_kb is not None else "Unavailable"
+            if rec.confidence == "HEURISTIC":
+                conf_str = "HEURISTIC (Workload pattern analysis; not experimentally measured)"
+            elif rec.verdict == "RECOMMENDED":
+                conf_str = "EXPERIMENTAL (Empirically validated; selected by MySQL optimizer)"
+            elif rec.verdict == "NEUTRAL":
+                conf_str = "EXPERIMENTAL (Empirically evaluated; neutral performance impact)"
+            else:
+                conf_str = "EXPERIMENTAL (Empirically evaluated; not selected by MySQL optimizer)"
 
             lines.append(f"Rank {rec.rank}: ({col_str})  -->  [{rec.verdict}]")
+            lines.append(f"  Confidence        : {conf_str}")
             lines.append(f"  Heuristic Score   : {rec.candidate.score:.1f}")
             lines.append(f"  Estimated Storage : {storage_str}")
             lines.append(f"  Supporting Queries: {', '.join(rec.candidate.supporting_query_ids)}")
@@ -311,12 +326,14 @@ def format_text_report(report: AdvisorReport) -> str:
 
     # Safety and Cleanup Status
     lines.append(sub_bar)
-    if not report.cleanup_verified or report.cleanup_error:
+    if report.cleanup_status == "CLEANUP_FAILED" or report.cleanup_verified is False or report.cleanup_error:
         lines.append("CRITICAL SAFETY WARNING: UNVERIFIED INDEX CLEANUP")
         lines.append(f"  Error: {report.cleanup_error or 'Index was not verified absent after drop.'}")
         if report.cleanup_risk:
             lines.append(f"  Risk : {report.cleanup_risk}")
         lines.append("  Manual Recovery: Check 'SHOW INDEX FROM students' and execute DROP INDEX if lingering.")
+    elif report.mode == "dry_run":
+        lines.append("Safety Status: Clean. Dry-run mode: zero DDL executed; temporary objects not applicable.")
     else:
         lines.append("Safety Status: Clean. All temporary objects verified absent; baseline schema preserved.")
     lines.append(bar)
@@ -376,6 +393,10 @@ def run_advisor(
         workload_query_count=len(workload.queries),
         existing_indexes=existing_idx_names,
         existing_redundancies=redundancy_notes,
+        cleanup_status="VERIFIED" if allow_live_ddl else "NOT_APPLICABLE",
+        cleanup_verified=True if allow_live_ddl else None,
+        cleanup_error=None,
+        cleanup_risk=None,
     )
 
     # 4. Candidate Generation & Heuristic Ranking
@@ -398,12 +419,24 @@ def run_advisor(
         )
 
         # Track any cleanup failures
-        if not eval_report.cleanup_verified and eval_report.was_created:
+        if eval_report.cleanup_status == "CLEANUP_FAILED" or (not eval_report.cleanup_verified and eval_report.was_created):
             report.cleanup_verified = False
+            report.cleanup_status = "CLEANUP_FAILED"
             report.cleanup_error = eval_report.cleanup_error or "Post-drop verification failed."
             report.cleanup_risk = eval_report.cleanup_risk
 
         verdict, verdict_reason = determine_verdict(candidate, eval_report, allow_live_ddl)
+        has_experimental_evidence = bool(
+            allow_live_ddl
+            and eval_report
+            and eval_report.mode == "live"
+            and eval_report.was_created
+            and (
+                any(qr.candidate_plan is not None for qr in eval_report.query_results)
+                or not eval_report.query_results
+            )
+        )
+        confidence = "EXPERIMENTAL" if has_experimental_evidence else "HEURISTIC"
         storage_b = eval_report.storage_estimate.estimated_bytes if eval_report.storage_estimate else None
         storage_kb = eval_report.storage_estimate.estimated_kb if eval_report.storage_estimate else None
 
@@ -415,6 +448,7 @@ def run_advisor(
                 rank=rank,
                 candidate=candidate,
                 verdict=verdict,
+                confidence=confidence,
                 verdict_reason=verdict_reason,
                 storage_estimate_bytes=storage_b,
                 storage_estimate_kb=storage_kb,
@@ -534,7 +568,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             print(format_text_report(report))
 
-        if not report.cleanup_verified or report.cleanup_error:
+        if report.cleanup_status == "CLEANUP_FAILED" or report.cleanup_verified is False or report.cleanup_error:
             return 1
         return 0
 
